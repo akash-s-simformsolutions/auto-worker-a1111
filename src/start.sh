@@ -2,6 +2,10 @@
 
 echo "Worker Initiated"
 
+echo "Symlinking files from Network Volume"
+rm -rf /stable-diffusion-webui/models && \
+  ln -s /runpod-volume/stable-diffusion-webui/models /stable-diffusion-webui/models
+  
 echo "Starting WebUI API"
 TCMALLOC="$(ldconfig -p | grep -Po "libtcmalloc.so.\d" | head -n 1)"
 export LD_PRELOAD="${TCMALLOC}"
