@@ -12,7 +12,7 @@ python /stable-diffusion-webui/webui.py \
   --skip-python-version-check \
   --skip-torch-cuda-test \
   --skip-install \
-  --ckpt /model.safetensors \
+  --api-log \
   --opt-sdp-attention \
   --disable-safe-unpickle \
   --port 3000 \
