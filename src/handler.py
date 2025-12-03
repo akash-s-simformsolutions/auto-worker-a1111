@@ -1,64 +1,130 @@
-import time
 import runpod
-import requests
-from requests.adapters import HTTPAdapter, Retry
+import aiohttp
+import asyncio
+from typing import Dict, Any
 
 LOCAL_URL = "http://127.0.0.1:3000/sdapi/v1"
 
-automatic_session = requests.Session()
-retries = Retry(total=10, backoff_factor=0.1, status_forcelist=[502, 503, 504])
-automatic_session.mount('http://', HTTPAdapter(max_retries=retries))
+# Configuration for aiohttp session
+TIMEOUT = aiohttp.ClientTimeout(total=600)
+RETRY_ATTEMPTS = 10
+RETRY_DELAY = 0.1
 
 
 # ---------------------------------------------------------------------------- #
 #                              Automatic Functions                             #
 # ---------------------------------------------------------------------------- #
-def wait_for_service(url):
+async def wait_for_service(url: str) -> None:
     """
     Check if the service is ready to receive requests.
     """
     retries = 0
+    timeout = aiohttp.ClientTimeout(total=120)
 
-    while True:
-        try:
-            requests.get(url, timeout=120)
-            return
-        except requests.exceptions.RequestException:
-            retries += 1
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        return
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                retries += 1
 
-            # Only log every 15 retries so the logs don't get spammed
-            if retries % 15 == 0:
-                print("Service not ready yet. Retrying...")
-        except Exception as err:
-            print("Error: ", err)
+                # Only log every 15 retries so the logs don't get spammed
+                if retries % 15 == 0:
+                    print("Service not ready yet. Retrying...")
+            except Exception as err:
+                print("Error: ", err)
 
-        time.sleep(0.2)
+            await asyncio.sleep(0.2)
 
 
-def run_inference(inference_request):
+async def run_inference(inference_request: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Run inference on a request.
+    Run inference on a request with retry logic.
     """
-    response = automatic_session.post(url=f'{LOCAL_URL}/txt2img',
-                                      json=inference_request, timeout=600)
-    return response.json()
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                async with session.post(
+                    url=f'{LOCAL_URL}/txt2img',
+                    json=inference_request
+                ) as response:
+                    if response.status in [502, 503, 504] and attempt < RETRY_ATTEMPTS - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))  # Exponential backoff
+                        continue
+                    
+                    response.raise_for_status()
+                    return await response.json()
+            except aiohttp.ClientError as e:
+                if attempt < RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                raise Exception(f"Failed to run inference after {RETRY_ATTEMPTS} attempts: {str(e)}")
+        
+        raise Exception(f"Failed to run inference after {RETRY_ATTEMPTS} attempts")
 
 
 # ---------------------------------------------------------------------------- #
 #                                RunPod Handler                                #
 # ---------------------------------------------------------------------------- #
-def handler(event):
+async def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    This is the handler function that will be called by the serverless.
+    This is the async handler function that will be called by the serverless.
+    Processes requests concurrently for better resource utilization.
+    
+    Args:
+        job: Contains the input data and request metadata
+        
+    Returns:
+        Dict containing the generated image data
     """
+    try:
+        job_input = job["input"]
+        result = await run_inference(job_input)
+        
+        # return the output that you want to be returned like pre-signed URLs to output artifacts
+        return result
+    except Exception as e:
+        return {"error": str(e), "status": "failed"}
 
-    json = run_inference(event["input"])
 
-    # return the output that you want to be returned like pre-signed URLs to output artifacts
-    return json
+def concurrency_modifier(current_concurrency: int) -> int:
+    """
+    Dynamically adjust the worker's concurrency level.
+    
+    Args:
+        current_concurrency: The current concurrency level
+        
+    Returns:
+        int: The new concurrency level
+    """
+    # Configuration for concurrency limits
+    # Adjust these based on your GPU memory and performance testing
+    max_concurrency = 5  # Maximum concurrent requests
+    min_concurrency = 1  # Minimum concurrency to maintain
+    
+    # For image generation workloads, we typically want to maintain
+    # a stable concurrency level based on GPU capacity
+    # Start with conservative settings and adjust based on monitoring
+    
+    # You can implement dynamic scaling logic here based on:
+    # - GPU memory usage
+    # - Average processing time
+    # - Queue depth
+    # For now, we'll use a fixed optimal concurrency
+    
+    optimal_concurrency = 3  # Good balance for most GPU setups
+    return min(optimal_concurrency, max_concurrency)
 
 
 if __name__ == "__main__":
-    wait_for_service(url=f'{LOCAL_URL}/sd-models')
+    # Wait for service using asyncio
+    asyncio.run(wait_for_service(url=f'{LOCAL_URL}/sd-models'))
     print("WebUI API Service is ready. Starting RunPod Serverless...")
-    runpod.serverless.start({"handler": handler})
+    print(f"Concurrent request handling enabled (max concurrency: 5)")
+    
+    runpod.serverless.start({
+        "handler": handler,
+        "concurrency_modifier": concurrency_modifier
+    })
